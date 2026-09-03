@@ -4,6 +4,8 @@ Aplicación genérica para explorar cualquier archivo CSV
 Basado en el Capítulo 1: "Exploratory Data Analysis" de Practical Statistics for Data Scientists
 """
 
+import io
+import warnings
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,8 +13,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
 from scipy.stats import trim_mean
-import io
-import warnings
+from ucimlrepo import fetch_ucirepo
+
 warnings.filterwarnings('ignore')
 
 # Configurar el tema y estilo
@@ -25,16 +27,22 @@ plt.rcParams['figure.figsize'] = (10, 6)
 # ============================================================================
 
 def detect_variable_type(series):
-    unique_count = series.nunique()
-    
     if pd.api.types.is_numeric_dtype(series):
-        if unique_count <= 15:
-            return 'Cualitativa'
         return 'Cuantitativa'
-    elif pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series) or isinstance(series.dtype, pd.CategoricalDtype) or pd.api.types.is_bool_dtype(series):
+    
+    is_categorical = (
+        pd.api.types.is_object_dtype(series) or 
+        pd.api.types.is_string_dtype(series) or 
+        isinstance(series.dtype, pd.CategoricalDtype) or 
+        pd.api.types.is_bool_dtype(series)
+    )
+    
+    if is_categorical:
         total_count = series.count()
         if total_count == 0:
             return 'Otro'
+        
+        unique_count = series.nunique()
         if unique_count <= 20 or (unique_count / total_count) < 0.5:
             return 'Cualitativa'
         else:
@@ -45,7 +53,10 @@ def detect_variable_type(series):
 def classify_variables(df):
     variable_types = {}
     for col in df.columns:
-        variable_types.setdefault(detect_variable_type(df[col]), []).append(col)
+        var_type = detect_variable_type(df[col])
+        if var_type not in variable_types:
+            variable_types[var_type] = []
+        variable_types[var_type].append(col)
     return variable_types
 
 def compute_location_stats(series):
@@ -63,13 +74,17 @@ def compute_variability_stats(series):
     stats = series.agg(['std', 'var', 'mean', 'median', 'min', 'max'])
     quantiles = series.quantile([0.25, 0.75])
     
+    cv_value = np.nan
+    if stats['mean'] != 0 and not pd.isna(stats['std']):
+        cv_value = (stats['std'] / abs(stats['mean'])) * 100
+    
     return {
         'Desv. Est.': stats['std'],
         'Varianza': stats['var'],
         'MAD': (series - stats['median']).abs().median(),
         'Rango': stats['max'] - stats['min'],
         'RIC (IQR)': quantiles[0.75] - quantiles[0.25],
-        'CV (%)': (stats['std'] / stats['mean'] * 100) if stats['mean'] != 0 else np.nan,
+        'CV (%)': cv_value,
     }
 
 
@@ -98,7 +113,8 @@ def compute_weighted_stats(df, val_col, weight_col):
     values = df.loc[mask, val_col].values
     weights = df.loc[mask, weight_col].values
     
-    if weights.sum() == 0:
+    weights_sum = weights.sum()
+    if weights_sum <= 0:
         return np.nan, np.nan
     
     weighted_mean = np.average(values, weights=weights)
@@ -108,17 +124,37 @@ def compute_weighted_stats(df, val_col, weight_col):
     sorted_weights = weights[sorted_indices]
     
     cum_weights = np.cumsum(sorted_weights)
-    cutoff = sorted_weights.sum() / 2.0
+    cutoff = weights_sum / 2.0
     
-    weighted_median_idx = np.searchsorted(cum_weights, cutoff)
-    weighted_median = sorted_values[weighted_median_idx]
+    if cum_weights[-1] == 0:
+        return weighted_mean, np.nan
+    
+    idx = np.searchsorted(cum_weights, cutoff)
+    idx = min(idx, len(sorted_values) - 1)
+    
+    if idx > 0 and idx < len(cum_weights) and cum_weights[idx] != cutoff:
+        w1, w2 = cum_weights[idx - 1], cum_weights[idx]
+        weight_diff = w2 - w1
+        if weight_diff != 0:
+            weighted_median = (sorted_values[idx - 1] * (w2 - cutoff) + sorted_values[idx] * (cutoff - w1)) / weight_diff
+        else:
+            weighted_median = sorted_values[idx]
+    else:
+        weighted_median = sorted_values[idx]
     
     return weighted_mean, weighted_median
 
 
 def plot_histogram(series, bins=30):
     """
-    Crea un histograma para variables cuantitativas
+    Genera visualización de distribución de frecuencias mediante histograma.
+    
+    Parámetros:
+        series: pd.Series - Variable numérica a visualizar
+        bins: int - Número de intervalos (por defecto 30)
+    
+    Retorna:
+        matplotlib.figure.Figure - Objeto figura con histograma renderizado
     """
     fig, ax = plt.subplots(figsize=(10, 5))
     series.plot.hist(bins=bins, ax=ax, edgecolor='black', alpha=0.7)
@@ -130,6 +166,19 @@ def plot_histogram(series, bins=30):
 
 
 def plot_histogram_density(series, bins=20):
+    """
+    Superpone histograma normalizado con estimador de densidad kernel (KDE).
+    
+    Útil para identificar multimodalidad y características de la distribución
+    más allá de la discretización inherente a bins fijos.
+    
+    Parámetros:
+        series: pd.Series - Variable numérica
+        bins: int - Número de intervalos (por defecto 20)
+    
+    Retorna:
+        matplotlib.figure.Figure - Figura con histograma + curva de densidad KDE
+    """
     fig, ax = plt.subplots(figsize=(10, 5))
     series.plot.hist(density=True, bins=bins, ax=ax, alpha=0.6, edgecolor='black')
     series.plot.density(ax=ax, linewidth=2, color='#FFB7B2')
@@ -226,10 +275,350 @@ def plot_frequency_table(series, top_n=None):
     
     return result_df
 
+def generate_markdown_report(df, var_types, metadata_df):
+    md = []
+    md.append("# 📊 Reporte Completo de Análisis Exploratorio de Datos (EDA)\n")
+    md.append("---\n\n")
+    
+    md.append("## ⚙️ Configuración del Dataset\n\n")
+    md.append(f"- **Variables Cuantitativas Seleccionadas:** {len(var_types.get('Cuantitativa', []))}\n")
+    md.append(f"- **Variables Cualitativas Seleccionadas:** {len(var_types.get('Cualitativa', []))}\n")
+    md.append(f"- **Otras Variables / Texto:** {len(var_types.get('Mixta/Texto', []))}\n\n")
+    
+    md.append("### 📋 Tabla de Configuración\n\n")
+    md.append("| " + " | ".join(metadata_df.columns) + " |\n")
+    md.append("|" + "|".join(["---"] * len(metadata_df.columns)) + "|\n")
+    for _, row in metadata_df.iterrows():
+        md.append("| " + " | ".join(str(x) for x in row.values) + " |\n")
+    md.append("\n")
+    
+    md.append("### 📝 Descripciones de Variables\n\n")
+    descripciones_presentes = False
+    for _, row in metadata_df.iterrows():
+        if pd.notna(row['Descripción']) and str(row['Descripción']).strip() != '':
+            md.append(f"**{row['Nuevo Nombre']}:** {row['Descripción']}\n\n")
+            descripciones_presentes = True
+    
+    if not descripciones_presentes:
+        md.append("*No hay descripciones disponibles. Complete la columna 'Descripción' en la pestaña Configuración para visualizar detalles de las variables.*\n\n")
+    
+    md.append("---\n\n")
+    
+    md.append("## 📋 Descripción General del Dataset\n\n")
+    md.append(f"- **Filas:** {df.shape[0]}\n")
+    md.append(f"- **Columnas:** {df.shape[1]}\n")
+    md.append(f"- **Valores Faltantes Totales:** {df.isnull().sum().sum()}\n\n")
+    
+    md.append("💡 **Concepto Didáctico:** La descripción estadística consolidada proporciona un panorama distributivo inmediato, resumiendo la tendencia central, la dispersión y la forma subyacente de los datos.\n\n")
+    
+    md.append("### 📐 Nota Educativa: Resumen de los Cinco Números\n\n")
+    md.append("**Definición:** Conjunto de descriptores estandarizados que trazan la distribución empírica en el espacio probabilístico.\n\n")
+    md.append("$$S = \\{\\min(X), Q_1, \\tilde{x}, Q_3, \\max(X)\\}$$\n\n")
+    
+    md.append("### 💻 Nota Educativa: Implementación en Python\n\n")
+    md.append("```python\nimport pandas as pd\n\nresumen = df.describe()\n```\n\n")
+    
+    md.append("✅ **Recomendación:** Utilice esta tabla generada como un escáner inicial veloz para detectar anomalías obvias, tales como valores mínimos negativos en variables que deberían ser estrictamente positivas.\n\n")
+    
+    md.append("---\n\n")
+    
+    quant_vars = var_types.get('Cuantitativa', [])
+    qual_vars = var_types.get('Cualitativa', [])
+    
+    if quant_vars:
+        md.append("### 🔢 Resumen Estadístico Global (Variables Cuantitativas)\n\n")
+        desc_df = df[quant_vars].describe().reset_index()
+        md.append("| Estadística | " + " | ".join(str(col) for col in desc_df.columns[1:]) + " |\n")
+        md.append("|" + "|".join(["---"] * len(desc_df.columns)) + "|\n")
+        for _, row in desc_df.iterrows():
+            md.append("| " + " | ".join(str(round(x, 6)) if isinstance(x, (int, float)) else str(x) for x in row.values) + " |\n")
+        md.append("\n\n")
+    
+    md.append("---\n\n")
+    
+    if quant_vars:
+        md.append("## 🔢 Análisis Detallado de Variables Cuantitativas\n\n")
+        for var in quant_vars:
+            series = df[var].dropna()
+            md.append(f"### Variable: {var}\n\n")
+            
+            md.append("#### 📊 Visualizaciones y Distribución Analítica\n\n")
+            md.append("💡 **Concepto Didáctico:** Las descomposiciones visuales facilitan la apreciación inmediata de proporciones, asimetrías y comportamientos probabilísticos del espacio vectorial.\n\n")
+            
+            md.append("#### 📈 Información del Histograma y Tabla de Frecuencias\n\n")
+            md.append("##### 📐 Nota Educativa: Frecuencia Empírica\n\n")
+            md.append("**Definición:** Cálculo iterativo de la distribución agrupada en intervalos continuos.\n\n")
+            md.append("$$\\text{Frecuencia}(x) = \\sum_{i=1}^{n} I(x_i \\in \\text{bin})$$\n\n")
+            
+            md.append("### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\nimport matplotlib.pyplot as plt\n\ndf['columna'].plot.hist(bins=30, edgecolor='black')\n```\n\n")
+            
+            md.append("✅ **Recomendación:** Ajustar la magnitud de los intervalos es clave para no ocultar fluctuaciones reales ni generar densidades falsas.\n\n")
+            
+            counts, bin_edges = np.histogram(series, bins=30)
+            md.append("**Tabla de Frecuencias por Intervalos**\n\n")
+            md.append("| Rango Inicio | Rango Fin | Conteo |\n")
+            md.append("|---|---|---|\n")
+            for i in range(len(counts)):
+                md.append(f"| {bin_edges[i]:.6f} | {bin_edges[i+1]:.6f} | {counts[i]} |\n")
+            md.append("\n")
+            
+            md.append("#### 📈 Información del Histograma + Densidad (KDE)\n\n")
+            md.append("##### 📐 Nota Educativa: Estimación Kernel (KDE)\n\n")
+            md.append("**Definición:** Suavizado matemático probabilístico del histograma subyacente de la variable.\n\n")
+            md.append("$$\\hat{f}(x; h) = \\frac{1}{nh} \\sum_{i=1}^{n} K\\left(\\frac{x - x_i}{h}\\right)$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\nimport matplotlib.pyplot as plt\n\ndf['columna'].plot.hist(density=True, bins=20)\ndf['columna'].plot.density()\n```\n\n")
+            
+            md.append("✅ **Conclusión:** La superposición probabilística faculta comparar directamente contra curvas normales estandarizadas.\n\n")
+            
+            md.append("#### 📦 Información del Boxplot y Tabla de Datos Estructural\n\n")
+            md.append("##### 📐 Nota Educativa: Rango Intercuartílico e Interpretación\n\n")
+            md.append("**Definición:** Evaluación posicional exenta de sesgo perimetral midiendo el 50% intermedio.\n\n")
+            md.append("$$\\text{RIC} = Q_3 - Q_1 \\quad \\text{Bigotes} = [Q_1 - 1.5 \\times \\text{RIC}, Q_3 + 1.5 \\times \\text{RIC}]$$\n\n")
+            
+            md.append("### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport plotly.express as px\n\npx.box(df, y='columna')\n```\n\n")
+            
+            md.append("✅ **Recomendación:** Un boxplot comprimido con extensa fragmentación más allá de los bigotes alerta de anomalías profundas en la ingesta.\n\n")
+            
+            desc_stats = series.describe()
+            md.append("**Estadísticas de Distribución**\n\n")
+            md.append("| Estadística | Valor |\n")
+            md.append("|---|---|\n")
+            for idx, val in desc_stats.items():
+                md.append(f"| {idx} | {val:.6f} |\n")
+            md.append("\n")
+            
+            loc_stats = compute_location_stats(series)
+            md.append("#### 📈 Estadísticas de Localización\n\n")
+            md.append("💡 **Concepto Didáctico:** Las medidas de tendencia central resumen el conjunto de datos en un valor representativo. La media convencional es altamente sensible a valores atípicos, mientras que la mediana y la media recortada ofrecen alternativas robustas.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Fórmulas de Tendencia Central\n\n")
+            md.append("**Definición:** Descomposición matemática integral de las métricas principales para dimensionar el punto de equilibrio escalar en una distribución asimétrica.\n\n")
+            md.append("$$\\text{Media: } \\bar{x} = \\frac{1}{n}\\sum_{i=1}^{n}x_i \\quad\\quad \\text{Mediana: } \\tilde{x} = x_{\\frac{n+1}{2}} \\quad\\quad \\text{Media Recortada: } \\bar{x}_{\\text{trim}} = \\frac{1}{n-2k}\\sum_{i=k+1}^{n-k}x_{(i)}$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\nfrom scipy.stats import trim_mean\n\nmedia = df['columna'].mean()\nmediana = df['columna'].median()\nmedia_recortada = trim_mean(df['columna'].dropna(), 0.1)\n```\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Extremos de la Distribución\n\n")
+            md.append("**Definición:** Identificación de los límites inferiores y superiores absolutos del espacio vectorial para evaluar el rango global.\n\n")
+            md.append("$$\\text{Mínimo: } \\min(X) \\quad\\quad \\text{Máximo: } \\max(X)$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\nminimo = df['columna'].min()\nmaximo = df['columna'].max()\n```\n\n")
+            
+            for k, v in loc_stats.items():
+                md.append(f"- **{k}:** {v:,.6f}\n")
+            md.append("\n")
+            
+            md.append("✅ **Conclusión:** La disonancia entre la media y la mediana permite inferir la asimetría de la distribución subyacente; brechas considerables justifican estadísticamente el uso de métricas recortadas.\n\n")
+            
+            var_stats = compute_variability_stats(series)
+            md.append("#### 📐 Estadísticas de Variabilidad\n\n")
+            md.append("💡 **Concepto Didáctico:** La variabilidad dimensiona la dispersión matemática. La Desviación Estándar penaliza severamente los atípicos elevándolos al cuadrado, mientras que la Desviación Absoluta Mediana (MAD) conserva un carácter inquebrantable frente al ruido.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Ecuaciones de Dispersión\n\n")
+            md.append("**Definición:** Funciones matemáticas para dimensionar la lejanía estandarizada de los puntos respecto a un pivote central.\n\n")
+            md.append("$$s^2 = \\frac{\\sum (x_i - \\bar{x})^2}{n-1} \\quad s = \\sqrt{s^2} \\quad \\text{MAD} = \\text{Mediana}(\\vert{}x_i - \\tilde{x}\\vert{})$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\ndesv = df['columna'].std()\nvar = df['columna'].var()\nmad = (df['columna'] - df['columna'].median()).abs().median()\n```\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Métricas Complementarias de Dispersión\n\n")
+            md.append("**Definición:** Ecuaciones para el rango absoluto, el rango intercuartílico (RIC) y la normalización de la dispersión frente a la media (CV).\n\n")
+            md.append("$$\\text{Rango} = \\max - \\min \\quad \\text{RIC} = Q_3 - Q_1 \\quad \\text{CV} = \\frac{s}{\\bar{x}} \\times 100$$\n\n")
+            
+            for k, v in var_stats.items():
+                md.append(f"- **{k}:** {v:,.6f}\n")
+            md.append("\n")
+            
+            md.append("✅ **Recomendación:** Coteje la desviación estándar contra el indicador MAD; si excede sustancialmente el valor del MAD, valide obligatoriamente la integridad y existencia de extremos severos.\n\n")
+            
+            dist_stats = compute_distribution_stats(series)
+            md.append("#### 📍 Estadísticas de Distribución\n\n")
+            md.append("💡 **Concepto Didáctico:** Los percentiles seccionan la distribución en tramos relativos de densidad probabilística. La asimetría (Skewness) revela la deformación lateral, y la curtosis dimensiona la pesadez estocástica de las colas.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Cuantiles\n\n")
+            md.append("**Definición:** Medida de posición no central que divide el conjunto de datos ordenados en partes porcentuales estandarizadas.\n\n")
+            md.append("$$P_k = \\text{Valor } x \\text{ tal que } P(X \\le x) = \\frac{k}{100}$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\npercentiles = df['columna'].quantile([0.05, 0.25, 0.5, 0.75, 0.95])\n```\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Momentos de la Distribución\n\n")
+            md.append("**Definición:** Cálculos estandarizados de tercer y cuarto orden para dimensionar direccionalidad de sesgo lateral y exceso de curtosis.\n\n")
+            md.append("$$\\text{Asimetría} = \\frac{\\mu_3}{\\sigma^3} \\quad \\text{Curtosis} = \\frac{\\mu_4}{\\sigma^4} - 3$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\nasimetria = df['columna'].skew()\ncurtosis = df['columna'].kurtosis()\n```\n\n")
+            
+            for k, v in dist_stats.items():
+                md.append(f"- **{k}:** {v:,.6f}\n")
+            md.append("\n")
+            
+            md.append("✅ **Conclusión:** Valores de asimetría fuera del umbral [-1, 1] evidencian distribuciones radicalmente sesgadas que pueden comprometer modelos de machine learning. Una curtosis superior a cero (leptocúrtica) es un marcador claro de alta incidencia de colas extremas.\n\n")
+            
+            md.append("#### 🔍 Análisis Detallado (Calidad de Datos)\n\n")
+            md.append("💡 **Concepto Didáctico:** El perfilamiento integral de calidad de datos permite auditar la integridad muestral, identificando colisiones (duplicados) y vacíos de información (faltantes) que pueden introducir sesgos algorítmicos.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Calidad de Datos\n\n")
+            md.append("**Definición:** Tasa de completitud y nivel cardinal de un vector de datos.\n\n")
+            md.append("$$\\text{Completitud} = 1 - \\frac{\\text{Nulos}}{N} \\quad\\quad \\text{Cardinalidad} = \\vert \\{x_1, x_2, ..., x_k\\} \\vert$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\nunicos = df['columna'].nunique()\nfaltantes = df['columna'].isnull().sum()\nduplicados = df['columna'].duplicated().sum()\n```\n\n")
+            
+            md.append(f"- **Total de Observaciones:** {len(series)}\n")
+            md.append(f"- **Valores Únicos:** {series.nunique()}\n")
+            md.append(f"- **Faltantes (del original):** {df[var].isnull().sum()}\n")
+            md.append(f"- **Duplicados:** {df[var].duplicated().sum()}\n")
+            md.append("\n")
+            
+            md.append("✅ **Recomendación:** Monitoree estrictamente los valores faltantes reportados en esta pestaña. Un nivel superior al 5-10% requiere técnicas de imputación avanzadas en lugar de la simple eliminación estadística.\n\n")
+            
+            md.append("#### ⚖️ Estadísticas Ponderadas (Teoría)\n\n")
+            md.append("💡 **Concepto Didáctico:** Las estadísticas ponderadas corrigen desbalances de muestreo o agrupan subpoblaciones calibrando el peso algorítmico individual de los registros.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Promedios Ponderados\n\n")
+            md.append("**Definición:** Ecuaciones robustas para determinar el equilibrio del centro considerando el nivel de impacto particular (peso).\n\n")
+            md.append("$$\\bar{x}_w = \\frac{\\sum_{i=1}^{n} w_i x_i}{\\sum_{i=1}^{n} w_i} \\quad \\text{Mediana}_w = \\text{Valor donde } \\sum w_i \\geq \\frac{\\sum w}{2}$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport numpy as np\n\nnp.average(df['columna_valor'], weights=df['columna_peso'])\n```\n\n")
+            
+            md.append("✅ **Recomendación:** Evalúe la brecha absoluta entre métricas simples y ponderadas; discrepancias altas acentúan que la variable de impacto o factor de expansión altera significativamente la visión inicial del mercado.\n\n")
+            
+            md.append("---\n\n")
+    
+    if qual_vars:
+        md.append("## 🏷️ Análisis Detallado de Variables Cualitativas\n\n")
+        for var in qual_vars:
+            series = df[var].dropna()
+            md.append(f"### Variable: {var}\n\n")
+            
+            md.append("#### 📊 Visualizaciones Categóricas\n\n")
+            md.append("💡 **Concepto Didáctico:** Las descomposiciones visuales categóricas facilitan la apreciación inmediata de proporciones volumétricas y comportamientos modales primarios.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Frecuencia Absoluta\n\n")
+            md.append("**Definición:** Sumatoria de ocurrencias exactas en base condicional para cada categoría discreta del espacio muestral.\n\n")
+            md.append("$$\\text{Frecuencia Absoluta} = \\sum_{i=1}^{n} I(x_i = C_j)$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\nimport matplotlib.pyplot as plt\n\ndf['columna_categorica'].value_counts().plot(kind='bar')\n```\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Proporción Circular\n\n")
+            md.append("**Definición:** Asignación de fragmentos en grados geométricos en base al porcentaje de participación relativa contra la suma total.\n\n")
+            md.append("$$\\text{Proporción Sector} = \\frac{\\text{Frecuencia de } C_j}{\\sum \\text{Frecuencias}} \\times 360^\\circ$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport matplotlib.pyplot as plt\n\nvalue_counts = df['columna_categorica'].value_counts()\nax.pie(value_counts, labels=value_counts.index, autopct='%1.1f%%')\n```\n\n")
+            
+            md.append("✅ **Recomendación:** Privilegie gráficos de barras en lugar del formato pastel para garantizar legibilidad cuantitativa al diferenciar magnitudes nominales en orden de impacto.\n\n")
+            
+            freq_df = plot_frequency_table(series)
+            md.append("#### 📋 Tabla de Frecuencias\n\n")
+            md.append("💡 **Concepto Didáctico:** El reporte tabular de frecuencias articula numéricamente la descomposición total, proyectando incidencias relativas fundamentales para un modelado probabilístico inicial.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Frecuencia Relativa y Porcentual\n\n")
+            md.append("**Definición:** Relación proporcional de la frecuencia absoluta frente al total de observaciones en la muestra categórica.\n\n")
+            md.append("$$f_i = \\frac{n_i}{N} \\times 100$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\nfreq_table = df['columna_categorica'].value_counts()\nfreq_pct = (100 * freq_table / len(df['columna_categorica'].dropna()))\n```\n\n")
+            
+            md.append("| Categoría | Conteo | Porcentaje |\n")
+            md.append("|---|---|---|\n")
+            for _, row in freq_df.iterrows():
+                md.append(f"| {row['Categoría']} | {row['Conteo']} | {row['Porcentaje']:.6f}% |\n")
+            md.append("\n")
+            
+            md.append("✅ **Recomendación:** Analice los porcentajes acumulados para identificar rápidamente qué pocas categorías concentran la mayor parte de las observaciones totales.\n\n")
+            
+            md.append("#### 📊 Análisis Detallado\n\n")
+            md.append("💡 **Concepto Didáctico:** La **Moda** representa la categoría con mayor ocurrencia. Las **Probabilidades** empíricas reflejan la proporción estandarizada de cada categoría. El **Valor Esperado** (distribución uniforme) traza la frecuencia teórica si todas las categorías lograran ser igualmente probables.\n\n")
+            
+            md.append("##### 📐 Nota Educativa: Probabilidad Empírica y Valor Esperado\n\n")
+            md.append("**Definición:** Cuantificación de la probabilidad basada en la frecuencia relativa observada y estimación teórica bajo distribución uniforme.\n\n")
+            md.append("$$P(x_i) = \\frac{f_i}{N} \\quad\\quad E[X]_{\\text{uniforme}} = \\frac{N}{k}$$\n\n")
+            
+            md.append("##### 💻 Nota Educativa: Implementación en Python\n\n")
+            md.append("```python\nimport pandas as pd\n\nprobabilidades = df['columna_categorica'].value_counts(normalize=True)\nmoda = df['columna_categorica'].mode()[0]\n```\n\n")
+            
+            total_obs = len(series)
+            cat_unicas = series.nunique()
+            modas_calc = series.mode()
+            moda_val = modas_calc[0] if len(modas_calc) > 0 else "N/A"
+            valor_esperado = total_obs / cat_unicas if cat_unicas > 0 else 0
+            
+            md.append(f"- **Total Observaciones (N):** {total_obs}\n")
+            md.append(f"- **Categorías Únicas (k):** {cat_unicas}\n")
+            md.append(f"- **Moda:** {moda_val}\n")
+            md.append(f"- **Valor Esperado:** {valor_esperado:,.2f}\n")
+            md.append(f"- **Faltantes (del original):** {df[var].isnull().sum()}\n")
+            md.append(f"- **Duplicados:** {df[var].duplicated().sum()}\n")
+            md.append("\n")
+            
+            md.append("✅ **Conclusión:** Las divergencias estadísticamente significativas entre la frecuencia observada en la Moda y el Valor Esperado sugieren una distribución asimétrica que se aleja de la equiprobabilidad estricta, marcando un sesgo latente en el entorno muestral original.\n\n")
+            
+            md.append("---\n\n")
+    
+    md.append("## 📊 Análisis Multivariado\n\n")
+    md.append("💡 **Concepto Didáctico:** El análisis multivariado explora las relaciones simultáneas entre múltiples variables, evaluando la interdependencia lineal mediante matrices de correlación y visualizando patrones bivariados.\n\n")
+    
+    quant_vars = var_types.get('Cuantitativa', [])
+    qual_vars = var_types.get('Cualitativa', [])
+    
+    if len(quant_vars) >= 2:
+        md.append("### 📈 Correlación entre Variables Cuantitativas\n\n")
+        md.append("#### 📐 Nota Educativa: Coeficiente de Correlación de Pearson\n\n")
+        md.append("**Definición:** Métrica algorítmica que cuantifica la dependencia lineal estructural entre dos vectores cuantitativos independientes.\n\n")
+        md.append("$$r_{xy} = \\frac{\\sum (x_i - \\bar{x})(y_i - \\bar{y})}{\\sqrt{\\sum (x_i - \\bar{x})^2 \\sum (y_i - \\bar{y})^2}}$$\n\n")
+        
+        md.append("#### 💻 Nota Educativa: Implementación en Python\n\n")
+        md.append("```python\nimport pandas as pd\nimport seaborn as sns\n\ncorr_matrix = df[['columna_1', 'columna_2']].corr()\nsns.heatmap(corr_matrix, annot=True, cmap='coolwarm')\n```\n\n")
+        
+        corr_matrix = df[quant_vars].corr()
+        md.append("#### 📊 Matriz de Correlación entre Variables Cuantitativas\n\n")
+        md.append("| Variable | " + " | ".join(str(col) for col in corr_matrix.columns) + " |\n")
+        md.append("|---|" + "|".join(["---"] * len(corr_matrix.columns)) + "|\n")
+        for idx, row in corr_matrix.iterrows():
+            md.append(f"| {idx} | " + " | ".join(f"{x:.6f}" for x in row.values) + " |\n")
+        md.append("\n")
+        
+        md.append("✅ **Conclusión:** Los bloques perimetrales marcados con extremada intensidad de color (cercanos a 1 o -1) advierten sobre escenarios de multicolinealidad estructural; depure las variables redundantes si procede a entrenar modelos predictivos estocásticos.\n\n")
+    
+    if len(quant_vars) >= 2:
+        md.append("### 📍 Diagrama de Dispersión (Bivariado)\n\n")
+        md.append("💡 **Concepto Didáctico:** El diagrama de dispersión proyecta pares iterados cartesianos de valores bi-dimensionales; resulta invaluable facilitando la identificación instintiva de clusters, tendencias paramétricas subyacentes y valores atípicos bivariados atípicos.\n\n")
+        md.append("✅ **Conclusión:** La consolidación central de los puntos intercepta el análisis correlacional previo; las trayectorias compactas sin dispersión residual avalan robustamente la dependencia lineal bivariada deducida.\n\n")
+    
+    if len(quant_vars) > 0 and len(qual_vars) > 0:
+        md.append("### 🔀 Comparación: Variable Cuantitativa vs Cualitativa\n\n")
+        md.append("💡 **Concepto Didáctico:** Descomponer una variable cuantitativa continua seccionándola a través de perfiles categóricos expone divergencias sustanciales entre distribuciones, medias poblacionales y niveles de varianza intragrupal.\n\n")
+        
+        md.append("#### 📐 Nota Educativa: Rango Intercuartílico Condicional\n\n")
+        md.append("**Definición:** Medida de dispersión estadística segregada por particiones discretas para evaluar la variabilidad intragrupal.\n\n")
+        md.append("$$\\text{RIC}_g = Q_{3,g} - Q_{1,g} \\quad \\text{donde } g \\text{ representa cada categoría}$$\n\n")
+        
+        md.append("#### 💻 Nota Educativa: Implementación en Python\n\n")
+        md.append("```python\nimport plotly.express as px\n\npx.box(df, x='columna_categorica', y='columna_cuantitativa')\n```\n\n")
+        
+        md.append("✅ **Recomendación:** Verifique los intervalos de interposición visual en los perfiles boxplot; una total disociación asimétrica de la estructura de cuartiles es un hallazgo concluyente de segmentación natural.\n\n")
+    
+    md.append("---\n\n")
+    md.append("## 📄 Fin del Reporte\n\n")
+    md.append("*Reporte generado automáticamente por Dashboard EDA*\n")
+    md.append("*Basado en: Practical Statistics for Data Scientists - Capítulo 1*\n\n")
+    
+    return "\n".join(md)
+
 
 # ============================================================================
 # INTERFAZ PRINCIPAL
 # ============================================================================
+
 
 st.title("📊 Dashboard de Análisis Exploratorio de Datos (EDA)")
 st.markdown("""
@@ -240,13 +629,13 @@ Basada en *Practical Statistics for Data Scientists* - Capítulo 1: Exploratory 
 st.sidebar.header("⚙️ Configuración")
 
 @st.cache_data
-def load_dataframe(file_bytes, filename):
-    compression_type = 'gzip' if filename.endswith('.gz') else None
-    return pd.read_csv(io.BytesIO(file_bytes), compression=compression_type, sep=None, engine='python')
+def load_dataframe(uploaded_file):
+    uploaded_file.seek(0)
+    compression_type = 'gzip' if uploaded_file.name.endswith('.gz') else None
+    return pd.read_csv(uploaded_file, compression=compression_type, sep=None, engine='python')
 
 @st.cache_data
 def load_uciml_dataset(dataset_id):
-    from ucimlrepo import fetch_ucirepo
     dataset = fetch_ucirepo(id=dataset_id)
     X = dataset.data.features
     y = dataset.data.targets
@@ -264,7 +653,7 @@ df = None
 if data_source == "Cargar archivo CSV":
     uploaded_file = st.sidebar.file_uploader("Selecciona un archivo CSV", type=['csv', 'gz'])
     if uploaded_file is not None:
-        df = load_dataframe(uploaded_file.read(), uploaded_file.name)
+        df = load_dataframe(uploaded_file)
 elif data_source == "Bank Marketing":
     df = load_uciml_dataset(222)
 elif data_source == "Default of Credit Card Clients":
@@ -334,8 +723,8 @@ if df is not None:
             st.session_state.metadata_df = edited_metadata
         else:
             edited_metadata = st.session_state.metadata_df
-
-    included_cols = edited_metadata[edited_metadata["Incluir"] == True]
+        
+        included_cols = edited_metadata[edited_metadata["Incluir"] == True]
     df_modified = df[included_cols["Columna Original"].tolist()].copy()
     rename_dict = dict(zip(included_cols["Columna Original"], included_cols["Nuevo Nombre"]))
     df_modified.rename(columns=rename_dict, inplace=True)
@@ -356,6 +745,9 @@ if df is not None:
     
     df = df_modified
     
+    with tab_config:
+        pass
+    
     st.sidebar.markdown("---")
     st.sidebar.subheader("📈 Información del Dataset")
     st.sidebar.metric("Filas", df.shape[0])
@@ -370,12 +762,13 @@ if df is not None:
                 st.subheader("Primeras Filas")
                 df_head = df.head(10).copy()
                 df_head.index.name = None
-                st.dataframe(df_head.style.format(formatter={col: "{:,.6f}" for col in df.select_dtypes(include=np.number).columns}).bar(subset=df.select_dtypes(include=np.number).columns, color='#CDE0F5').set_properties(**{'background-color': '#F8FBFF', 'border': '1px solid #E2E8F0', 'color': '#1C2833'}), width='stretch')
+                numeric_cols = df_head.select_dtypes(include=np.number).columns
+                st.dataframe(df_head.style.format(formatter={col: "{:,.6f}" for col in numeric_cols}).bar(subset=numeric_cols, color='#CDE0F5').set_properties(**{'background-color': '#F8FBFF', 'border': '1px solid #E2E8F0', 'color': '#1C2833'}), width='stretch')
             
             with col2:
                 st.subheader("Información de Tipos de Datos")
                 faltantes = df.isnull().sum()
-                no_nulos = len(df) - faltantes
+                no_nulos = df.count()
                 desc_dict = dict(zip(included_cols["Nuevo Nombre"], included_cols["Descripción"]))
                 desc_values = [desc_dict.get(col, "") for col in df.columns]
                 info_df = pd.DataFrame({
@@ -512,7 +905,7 @@ df['columna'].plot.density()
                     st.dataframe(df_hist.style.format({"Rango_Inicio": "{:,.6f}", "Rango_Fin": "{:,.6f}", "Conteo": "{:,.6f}"}).bar(subset=['Conteo'], color='#F4C2C2').set_properties(**{'background-color': '#FFF5F5', 'border': '1px solid #FADCDC', 'color': '#641E16'}), width='stretch')
                 
                 else:
-                    st.info("""### 📐 Nota Educativa: Rango Intercuartílico (RIC)
+                    st.info(r"""### 📐 Nota Educativa: Rango Intercuartílico (RIC)
 **Definición:** Medida de dispersión estadística que evalúa la amplitud del 50% central de los datos para la construcción de los límites del boxplot.
 
 $$\text{RIC} = Q_3 - Q_1 \quad \text{Bigotes} = [Q_1 - 1.5 \times \text{RIC}, Q_3 + 1.5 \times \text{RIC}]$$
@@ -535,7 +928,7 @@ px.box(df, y='columna')
                 st.subheader(f"Estadísticas de Localización: {selected_var}")
                 location_stats = compute_location_stats(series)
                 
-                st.info("💡 **Concepto Didáctico:** Las medidas de tendencia central resumen el conjunto de datos en un valor representativo. La media convencional es altamente sensible a valores atípicos, mientras que la mediana y la media recortada ofrecen alternativas robustas[cite: 1].")
+                st.info("💡 **Concepto Didáctico:** Las medidas de tendencia central resumen el conjunto de datos en un valor representativo. La media convencional es altamente sensible a valores atípicos, mientras que la mediana y la media recortada ofrecen alternativas robustas.")
                 
                 st.info("""### 📐 Nota Educativa: Fórmulas de Tendencia Central
 **Definición:** Descomposición matemática integral de las métricas principales para dimensionar el punto de equilibrio escalar en una distribución asimétrica.
@@ -563,7 +956,7 @@ media_recortada = trim_mean(df['columna'].dropna(), 0.1)
                 with col3:
                     st.metric("Media Recortada (10%)", f"{location_stats['Media Recortada (10%)']:,.6f}")
                 
-                st.info("""### 📐 Nota Educativa: Extremos de la Distribución
+                st.info(r"""### 📐 Nota Educativa: Extremos de la Distribución
 **Definición:** Identificación de los límites inferiores y superiores absolutos del espacio vectorial para evaluar el rango global.
 
 $$\text{Mínimo: } \min(X) \quad\quad \text{Máximo: } \max(X)$$
@@ -585,7 +978,7 @@ maximo = df['columna'].max()
                 with col2:
                     st.metric("Máximo", f"{location_stats['Max']:,.6f}")
                 
-                st.success("✅ **Conclusión:** La disonancia entre la media y la mediana permite inferir la asimetría de la distribución subyacente; brechas considerables justifican estadísticamente el uso de métricas recortadas[cite: 1].")
+                st.success("✅ **Conclusión:** La disonancia entre la media y la mediana permite inferir la asimetría de la distribución subyacente; brechas considerables justifican estadísticamente el uso de métricas recortadas.")
                 
                 stats_df = pd.DataFrame(list(location_stats.items()), columns=['Estadística', 'Valor'])
                 stats_df.index.name = None
@@ -626,6 +1019,15 @@ mad = (df['columna'] - df['columna'].median()).abs().median()
 
 $$\text{Rango} = \max - \min \quad \text{RIC} = Q_3 - Q_1 \quad \text{CV} = \frac{s}{\bar{x}} \times 100$$
 """)
+                
+                col_rango, col_ric, col_cv = st.columns(3)
+                with col_rango:
+                    st.metric("Rango", f"{variability_stats['Rango']:,.6f}")
+                with col_ric:
+                    st.metric("RIC (IQR)", f"{variability_stats['RIC (IQR)']:,.6f}")
+                with col_cv:
+                    st.metric("CV (%)", f"{variability_stats['CV (%)']:,.6f}")
+                
                 st.success("✅ **Recomendación:** Coteje la desviación estándar contra el indicador MAD; si excede sustancialmente el valor del MAD, valide obligatoriamente la integridad y existencia de extremos severos.")
             
             with sub_tab4:
@@ -784,7 +1186,7 @@ np.average(df['columna_valor'], weights=df['columna_peso'])
                 )
                 
                 if chart_type == "Gráfico de Barras (Countplot)":
-                    st.info("""### 📐 Nota Educativa: Frecuencia Absoluta
+                    st.info(r"""### 📐 Nota Educativa: Frecuencia Absoluta
 **Definición:** Sumatoria de ocurrencias exactas en base condicional para cada categoría discreta del espacio muestral.
 
 $$\text{Frecuencia Absoluta} = \sum_{i=1}^{n} I(x_i = C_j)$$
@@ -846,19 +1248,11 @@ freq_pct = (100 * freq_table / len(df['columna_categorica'].dropna()))
                 freq_df = plot_frequency_table(series, top_n=top_n)
                 freq_df.index.name = None
                 st.dataframe(freq_df.style.format({"Conteo": "{:,.6f}", "Porcentaje": "{:,.6f}"}).bar(subset=['Conteo', 'Porcentaje'], color='#D4E6F1').set_properties(**{'background-color': '#F8F9FA', 'border': '1px solid #EAECEE', 'color': '#154360'}), width='stretch')
-                
-                csv = freq_df.to_csv(index=False)
-                st.download_button(
-                    label="Descargar Tabla de Frecuencias (CSV)",
-                    data=csv,
-                    file_name=f"frecuencias_{selected_var}.csv",
-                    mime="text/csv"
-                )
             
             with sub_tab3:
                 st.subheader(f"Análisis Detallado: {selected_var}")
                 
-                st.info("💡 **Concepto Didáctico:** La **Moda** representa la categoría con mayor ocurrencia. Las **Probabilidades** empíricas reflejan la proporción estandarizada de cada categoría. El **Valor Esperado** (distribución uniforme) traza la frecuencia teórica si todas las categorías lograran ser igualmente probables[cite: 1].")
+                st.info("💡 **Concepto Didáctico:** La **Moda** representa la categoría con mayor ocurrencia. Las **Probabilidades** empíricas reflejan la proporción estandarizada de cada categoría. El **Valor Esperado** (distribución uniforme) traza la frecuencia teórica si todas las categorías lograran ser igualmente probables.")
                 st.info(r"""### 📐 Nota Educativa: Probabilidad Empírica y Valor Esperado
 **Definición:** Cuantificación de la probabilidad basada en la frecuencia relativa observada y estimación teórica bajo distribución uniforme.
 
@@ -873,11 +1267,12 @@ import pandas as pd
 probabilidades = df['columna_categorica'].value_counts(normalize=True)
 moda = df['columna_categorica'].mode()[0]
 ```""")
-                st.success("✅ **Conclusión:** Las divergencias estadísticamente significativas entre la frecuencia observada en la Moda y el Valor Esperado sugieren una distribución asimétrica que se aleja de la equiprobabilidad estricta[cite: 1].")
+                st.success("✅ **Conclusión:** Las divergencias estadísticamente significativas entre la frecuencia observada en la Moda y el Valor Esperado sugieren una distribución asimétrica que se aleja de la equiprobabilidad estricta.")
                 
                 total_obs = len(series)
                 cat_unicas = series.nunique()
-                moda_val = series.mode()[0] if len(series.mode()) > 0 else "N/A"
+                modas_calc = series.mode()
+                moda_val = modas_calc[0] if len(modas_calc) > 0 else "N/A"
                 valor_esperado = total_obs / cat_unicas if cat_unicas > 0 else 0
                 probabilidades = series.value_counts(normalize=True).to_frame(name="Probabilidad")
                 
@@ -901,7 +1296,7 @@ moda = df['columna_categorica'].mode()[0]
                 probabilidades.index.name = None
                 st.dataframe(probabilidades.style.format("{:,.6f}").bar(color='#FCF3CF').set_properties(**{'background-color': '#FEF9E7', 'border': '1px solid #FCF3CF', 'color': '#7D6608'}), width='stretch')
                 
-                st.success("✅ **Conclusión:** Las divergencias estadísticamente significativas entre la frecuencia observada en la Moda y el Valor Esperado sugieren una distribución asimétrica que se aleja de la equiprobabilidad estricta, marcando un sesgo latente en el entorno muestral original[cite: 1].")
+                st.success("✅ **Conclusión:** Las divergencias estadísticamente significativas entre la frecuencia observada en la Moda y el Valor Esperado sugieren una distribución asimétrica que se aleja de la equiprobabilidad estricta, marcando un sesgo latente en el entorno muestral original.")
         else:
             st.warning("No hay variables cualitativas en el dataset")
     
@@ -926,7 +1321,7 @@ moda = df['columna_categorica'].mode()[0]
             if len(quantitative_vars) >= 2:
                 st.subheader("Matriz de Correlación")
                 
-                st.info("💡 **Concepto Didáctico:** El coeficiente de correlación de Pearson evalúa formalmente la fuerza y vector direccional de la interdependencia estandarizada lineal entre variables continuas de manera simultánea[cite: 1].")
+                st.info("💡 **Concepto Didáctico:** El coeficiente de correlación de Pearson evalúa formalmente la fuerza y vector direccional de la interdependencia estandarizada lineal entre variables continuas de manera simultánea.")
                 st.info(r"""### 📐 Nota Educativa: Coeficiente de Correlación de Pearson
 **Definición:** Métrica algorítmica que cuantifica la dependencia lineal estructural entre dos vectores cuantitativos independientes.
 
@@ -947,15 +1342,17 @@ sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
                 
                 fig, ax = plt.subplots(figsize=(12, 10))
                 sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='vlag',
-                           center=0, vmin=-1, vmax=1, ax=ax, cbar_kws={'label': 'Correlación'})
-                ax.set_title("Matriz de Correlación - Variables Cuantitativas")
-                st.pyplot(fig)
+                           center=0, vmin=-1, vmax=1, ax=ax, 
+                           cbar_kws={'label': 'Coeficiente de Correlación'},
+                           square=True, linewidths=0.5, linecolor='white')
+                ax.set_title("Matriz de Correlación - Variables Cuantitativas", fontsize=14, fontweight='bold')
+                st.pyplot(fig, use_container_width=True)
                 
                 st.subheader("Matriz de Correlación (Tabla)")
                 corr_matrix.index.name = None
                 st.dataframe(corr_matrix.style.format("{:,.6f}").background_gradient(cmap='PRGn', vmin=-1, vmax=1).set_properties(**{'border': '1px solid #EAECEE', 'color': '#17202A'}), width='stretch')
                 
-                st.success("✅ **Conclusión:** Los bloques perimetrales marcados con extremada intensidad de color (cercanos a 1 o -1) advierten sobre escenarios de multicolinealidad estructural; depure las variables redundantes si procede a entrenar modelos predictivos estocásticos[cite: 1].")
+                st.success("✅ **Conclusión:** Los bloques perimetrales marcados con extremada intensidad de color (cercanos a 1 o -1) advierten sobre escenarios de multicolinealidad estructural; depure las variables redundantes si procede a entrenar modelos predictivos estocásticos.")
             else:
                 st.warning("Se necesitan al menos 2 variables cuantitativas para análisis de correlación")
                 
@@ -963,7 +1360,7 @@ sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
             if len(quantitative_vars) >= 2:
                 st.subheader("Diagrama de Dispersión")
                 
-                st.info("💡 **Concepto Didáctico:** El diagrama de dispersión proyecta pares iterados cartesianos de valores bi-dimensionales; resulta invaluable facilitando la identificación instintiva de clusters, tendencias paramétricas subyacentes y valores atípicos bivariados atípicos[cite: 1].")
+                st.info("💡 **Concepto Didáctico:** El diagrama de dispersión proyecta pares iterados cartesianos de valores bi-dimensionales; resulta invaluable facilitando la identificación instintiva de clusters, tendencias paramétricas subyacentes y valores atípicos bivariados atípicos.")
                 col1, col2 = st.columns(2)
                 with col1:
                     var_x = st.selectbox("Variable Eje X", quantitative_vars, index=0)
@@ -974,7 +1371,7 @@ sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
                 fig.update_traces(marker=dict(size=6, line=dict(width=1, color='DarkSlateGrey')))
                 st.plotly_chart(fig, use_container_width=True)
                 
-                st.success("✅ **Conclusión:** La consolidación central de los puntos intercepta el análisis correlacional previo; las trayectorias compactas sin dispersión residual avalan robustamente la dependencia lineal bivariada deducida[cite: 1].")
+                st.success("✅ **Conclusión:** La consolidación central de los puntos intercepta el análisis correlacional previo; las trayectorias compactas sin dispersión residual avalan robustamente la dependencia lineal bivariada deducida.")
             else:
                 st.warning("Se necesitan al menos 2 variables cuantitativas para generar un diagrama de dispersión.")
         
